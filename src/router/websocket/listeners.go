@@ -78,7 +78,8 @@ var e = []string{
 	server.BackupRestoreCompletedEvent,
 	server.TransferLogsEvent,
 	server.TransferStatusEvent,
-	"backup.status", // Real-time backup progress events... Should maybe make this an enum eventually like its buddies - ellie
+    "backup.status", // Real-time backup progress events... Should maybe make this an enum eventually like its buddies - ellie
+	"modrinth.status",  // Modrinth mod download/scan/update progress events
 }
 
 // ListenForServerEvents will listen for different events happening on a server

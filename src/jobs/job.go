@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/apex/log"
+
 	"github.com/pyrohost/elytra/src/remote"
 	"github.com/pyrohost/elytra/src/server"
 )
@@ -299,12 +301,17 @@ func (m *Manager) reportProgress(instance *Instance) {
 		}
 
 		// Send status notification to Panel asynchronously for ALL status changes
-		go func() {
-			if err := m.client.ReportJobCompletion(context.Background(), instance.Job.GetID(), notification); err != nil {
-				// Log error but don't fail the job
-				fmt.Printf("Failed to notify Panel of job status: %v\n", err)
+		go func(jobID, jobType string, status Status) {
+			if err := m.client.ReportJobCompletion(context.Background(), jobID, notification); err != nil {
+				// Log error with context but don't fail the job
+				log.WithFields(log.Fields{
+					"job_id":   jobID,
+					"job_type": jobType,
+					"status":   string(status),
+					"error":    err.Error(),
+				}).Warn("failed to notify Panel of job status")
 			}
-		}()
+		}(instance.Job.GetID(), instance.Job.GetType(), instance.Status)
 	}
 
 	// Send WebSocket event for real-time updates
@@ -351,13 +358,9 @@ func (m *Manager) publishWebSocketEvent(instance *Instance) {
 		eventData["error"] = instance.Error
 	}
 
-	// Include result data if completed
-	if instance.Status == StatusCompleted && instance.Result != nil {
-		if resultMap, ok := instance.Result.(map[string]interface{}); ok {
-			for key, value := range resultMap {
-				eventData[key] = value
-			}
-		}
+	// Include result data if completed or failed - wrap in "result" key as frontend expects
+	if (instance.Status == StatusCompleted || instance.Status == StatusFailed) && instance.Result != nil {
+		eventData["result"] = instance.Result
 	}
 
 	// Get the event type from the job (allows job-specific event types)
