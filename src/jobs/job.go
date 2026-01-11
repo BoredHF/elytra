@@ -400,15 +400,16 @@ func (m *Manager) reportProgress(instance *Instance) {
 					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 						// For final status, log at info level since it's important
 						// For progress updates, use debug level to avoid spam
-						logLevel := log.DebugLevel
-						if isFinalStatus {
-							logLevel = log.InfoLevel
-						}
-						log.WithFields(log.Fields{
+						logger := log.WithFields(log.Fields{
 							"job_id":   jobID,
 							"job_type": jobType,
 							"status":   string(status),
-						}).Level(logLevel).Msg("Panel notification timed out (Panel may be slow)")
+						})
+						if isFinalStatus {
+							logger.Info("Panel notification timed out (Panel may be slow)")
+						} else {
+							logger.Debug("Panel notification timed out (Panel may be slow)")
+						}
 
 						// For final status that timed out, schedule a retry after a delay
 						// This ensures users who navigate away can still see the final status
