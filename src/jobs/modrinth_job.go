@@ -3,6 +3,7 @@ package jobs
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
@@ -323,6 +324,7 @@ func (j *ModrinthDownloadJob) GetID() string      { return j.id }
 func (j *ModrinthDownloadJob) GetType() string    { return modrinthJobTypeDownload }
 func (j *ModrinthDownloadJob) GetProgress() int   { return j.progress }
 func (j *ModrinthDownloadJob) GetMessage() string { return j.message }
+func (j *ModrinthDownloadJob) IsAsync() bool      { return true }
 
 func (j *ModrinthDownloadJob) GetServerID() string           { return j.serverID }
 func (j *ModrinthDownloadJob) GetWebSocketEventType() string { return "modrinth.status" }
@@ -491,6 +493,7 @@ func (j *ModrinthBulkDownloadJob) GetID() string      { return j.id }
 func (j *ModrinthBulkDownloadJob) GetType() string    { return modrinthJobTypeDownloadBulk }
 func (j *ModrinthBulkDownloadJob) GetProgress() int   { return j.progress }
 func (j *ModrinthBulkDownloadJob) GetMessage() string { return j.message }
+func (j *ModrinthBulkDownloadJob) IsAsync() bool      { return true }
 
 func (j *ModrinthBulkDownloadJob) GetServerID() string           { return j.serverID }
 func (j *ModrinthBulkDownloadJob) GetWebSocketEventType() string { return "modrinth.status" }
@@ -572,6 +575,7 @@ func (j *ModrinthUpdateJob) GetID() string      { return j.id }
 func (j *ModrinthUpdateJob) GetType() string    { return modrinthJobTypeUpdate }
 func (j *ModrinthUpdateJob) GetProgress() int   { return j.progress }
 func (j *ModrinthUpdateJob) GetMessage() string { return j.message }
+func (j *ModrinthUpdateJob) IsAsync() bool      { return true }
 
 func (j *ModrinthUpdateJob) GetServerID() string           { return j.serverID }
 func (j *ModrinthUpdateJob) GetWebSocketEventType() string { return "modrinth.status" }
@@ -766,7 +770,11 @@ func (j *ModrinthScanJob) Execute(ctx context.Context, reporter ProgressReporter
 
 	if len(entries) == 0 {
 		reporter.ReportProgress(90, "No mods detected")
-		return map[string]interface{}{"files": []map[string]interface{}{}}, nil
+		return map[string]interface{}{
+			"successful": true,
+			"job_type":   modrinthJobTypeScan,
+			"files":      []map[string]interface{}{},
+		}, nil
 	}
 
 	reporter.ReportProgress(20, fmt.Sprintf("Found %d files, hashing...", len(entries)))
@@ -779,7 +787,18 @@ func (j *ModrinthScanJob) Execute(ctx context.Context, reporter ProgressReporter
 		default:
 		}
 
-		hashHex, err := hashFileSHA512(s, entry.path)
+		sha512Hex, err := hashFileSHA512(s, entry.path)
+		if err != nil {
+			return nil, err
+		}
+
+		// Calculate additional hashes for cross-platform matching
+		sha1Hex, err := hashFileSHA1(s, entry.path)
+		if err != nil {
+			return nil, err
+		}
+
+		murmur2, err := hashFileMurmur2(s, entry.path)
 		if err != nil {
 			return nil, err
 		}
@@ -791,7 +810,12 @@ func (j *ModrinthScanJob) Execute(ctx context.Context, reporter ProgressReporter
 			"path":     entry.path,
 			"name":     entry.name,
 			"size":     entry.size,
-			"hash":     "sha512:" + hashHex,
+			"hash":     "sha512:" + sha512Hex,
+			"hashes": map[string]interface{}{
+				"sha1":    sha1Hex,
+				"sha512":  sha512Hex,
+				"murmur2": murmur2,
+			},
 			"modified": entry.modified,
 		})
 	}
@@ -799,7 +823,9 @@ func (j *ModrinthScanJob) Execute(ctx context.Context, reporter ProgressReporter
 	reporter.ReportProgress(95, "Finalizing scan results...")
 
 	return map[string]interface{}{
-		"files": files,
+		"successful": true,
+		"job_type":   modrinthJobTypeScan,
+		"files":      files,
 	}, nil
 }
 
@@ -812,8 +838,9 @@ type modrinthJarEntry struct {
 
 func (j *ModrinthScanJob) collectJarEntries(s *server.Server) ([]modrinthJarEntry, error) {
 	var entries []modrinthJarEntry
+	fs := s.Filesystem().UnixFS()
 	for _, dir := range j.directories {
-		err := ufs.WalkDir(s.Filesystem().UnixFS(), dir, func(p string, d ufs.DirEntry, err error) error {
+		err := ufs.WalkDir(fs, dir, func(p string, d ufs.DirEntry, err error) error {
 			if err != nil {
 				if errors.Is(err, ufs.ErrNotExist) {
 					return ufs.SkipDir
@@ -829,7 +856,11 @@ func (j *ModrinthScanJob) collectJarEntries(s *server.Server) ([]modrinthJarEntr
 			if !strings.HasSuffix(strings.ToLower(d.Name()), ".jar") {
 				return nil
 			}
-			info, err := d.Info()
+			// Use Stat with the full path instead of d.Info() to avoid
+			// "bad file descriptor" errors. The DirEntry's Info() method
+			// uses a cached directory fd that may be closed by the time
+			// we call it.
+			info, err := fs.Stat(p)
 			if err != nil {
 				return err
 			}
@@ -1165,6 +1196,20 @@ func hashFileSHA512(s *server.Server, filePath string) (string, error) {
 	defer f.Close()
 
 	hasher := sha512.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func hashFileSHA1(s *server.Server, filePath string) (string, error) {
+	f, err := s.Filesystem().UnixFS().Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	hasher := sha1.New()
 	if _, err := io.Copy(hasher, f); err != nil {
 		return "", err
 	}

@@ -46,9 +46,25 @@ func postCreateJob(c *gin.Context) {
 		return
 	}
 
+	// Inject server_id from URL path parameter if not already present in job_data
+	// This ensures the job uses the server from the authenticated endpoint
+	serverParam := c.Param("server")
+	if serverParam != "" {
+		if existingServerID, ok := request.JobData["server_id"].(string); ok && existingServerID != "" {
+			// Validate that the provided server_id matches the URL parameter
+			if existingServerID != serverParam {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "server_id in job_data does not match URL server parameter"})
+				return
+			}
+		} else {
+			// Auto-inject server_id from URL parameter
+			request.JobData["server_id"] = serverParam
+		}
+	}
+
 	jobID, err := manager.CreateJob(request.JobType, request.JobData)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
