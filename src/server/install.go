@@ -284,6 +284,26 @@ func (ip *InstallationProcess) pullInstallationImage() error {
 			}
 		}
 
+		// Provide a more helpful error message for "not found" errors
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "No such image") {
+			// Check for known deprecated images and suggest alternatives
+			imageName := ip.Script.ContainerImage
+			if strings.Contains(imageName, "openjdk:8") {
+				return errors.Errorf(
+					"image '%s' not found: this image has been deprecated and removed from Docker Hub. "+
+						"Please update the installation container image in your Panel configuration to a supported alternative "+
+						"such as 'eclipse-temurin:8-jdk' or 'amazoncorretto:8'. Original error: %s",
+					imageName, errMsg,
+				)
+			}
+			return errors.Errorf(
+				"image '%s' not found: the image may have been removed, the tag may be incorrect, or there may be a network issue. "+
+					"Please verify the installation container image in your Panel configuration is correct and accessible. Original error: %s",
+				imageName, errMsg,
+			)
+		}
+
 		return err
 	}
 	defer r.Close()
