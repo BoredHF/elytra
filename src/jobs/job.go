@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -96,6 +97,7 @@ type Instance struct {
 	lastPanelNotify time.Time   // Track last Panel notification for rate limiting
 	lastStatus      Status      // Track last status to detect status changes
 	notifyMu        sync.Mutex  // Mutex to prevent race conditions in rate limiting
+	finalNotifySent bool        // Track if final status (completed/failed) was successfully sent to Panel
 }
 
 // NewManager creates a new job manager
@@ -311,17 +313,30 @@ func (m *Manager) reportProgress(instance *Instance) {
 		// Determine if we should send a Panel notification
 		// Always send on status changes (pending->running, running->completed/failed)
 		// Rate limit progress updates during "running" status
+		// For final status (completed/failed), always retry if not successfully sent
 		statusChanged := instance.Status != instance.lastStatus
+		isFinalStatus := instance.Status == StatusCompleted || instance.Status == StatusFailed
 		timeSinceLastNotify := time.Since(instance.lastPanelNotify)
 		shouldNotifyPanel := statusChanged ||
-			instance.Status == StatusCompleted ||
-			instance.Status == StatusFailed ||
+			isFinalStatus ||
 			timeSinceLastNotify >= panelNotifyMinInterval
+
+		// For final status, always notify if it hasn't been successfully sent yet
+		// This ensures users who navigate away can still see the final status
+		if isFinalStatus && !instance.finalNotifySent {
+			shouldNotifyPanel = true
+		}
 
 		if shouldNotifyPanel {
 			// Update tracking fields
 			instance.lastPanelNotify = time.Now()
-			instance.lastStatus = instance.Status
+			if statusChanged {
+				instance.lastStatus = instance.Status
+				// Reset final notify flag when status changes to a final state
+				if isFinalStatus {
+					instance.finalNotifySent = false
+				}
+			}
 		}
 
 		instance.notifyMu.Unlock()
@@ -355,17 +370,75 @@ func (m *Manager) reportProgress(instance *Instance) {
 			}
 
 			// Send status notification to Panel asynchronously
-			go func(jobID, jobType string, status Status) {
-				if err := m.client.ReportJobCompletion(context.Background(), jobID, notification); err != nil {
-					// Log error with context but don't fail the job
-					log.WithFields(log.Fields{
-						"job_id":   jobID,
-						"job_type": jobType,
-						"status":   string(status),
-						"error":    err.Error(),
-					}).Warn("failed to notify Panel of job status")
+			// Use a context with timeout to prevent notifications from hanging indefinitely
+			go func(jobID, jobType string, status Status, isFinalStatus bool) {
+				// For final status updates (completed/failed), use a longer timeout to ensure
+				// they eventually get through even if the Panel is slow. This is critical for
+				// users who navigate away and come back - they need to see the final status.
+				timeout := 10 * time.Second
+				if isFinalStatus {
+					timeout = 20 * time.Second // Longer timeout for final status to ensure delivery
 				}
-			}(instance.Job.GetID(), instance.Job.GetType(), instance.Status)
+
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				defer cancel()
+
+				err := m.client.ReportJobCompletion(ctx, jobID, notification)
+
+				// Update tracking for final status notifications
+				if isFinalStatus {
+					instance.notifyMu.Lock()
+					if err == nil {
+						instance.finalNotifySent = true
+					}
+					instance.notifyMu.Unlock()
+				}
+
+				if err != nil {
+					// Log error with context but don't fail the job
+					// Suppress context timeout/cancel errors to reduce log spam when Panel is slow
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+						// For final status, log at info level since it's important
+						// For progress updates, use debug level to avoid spam
+						logLevel := log.DebugLevel
+						if isFinalStatus {
+							logLevel = log.InfoLevel
+						}
+						log.WithFields(log.Fields{
+							"job_id":   jobID,
+							"job_type": jobType,
+							"status":   string(status),
+						}).Level(logLevel).Msg("Panel notification timed out (Panel may be slow)")
+
+						// For final status that timed out, schedule a retry after a delay
+						// This ensures users who navigate away can still see the final status
+						if isFinalStatus {
+							go func() {
+								// Retry after a short delay to give Panel time to recover
+								time.Sleep(5 * time.Second)
+								// Re-check if notification was sent (another goroutine might have succeeded)
+								instance.notifyMu.Lock()
+								needsRetry := !instance.finalNotifySent &&
+									(instance.Status == StatusCompleted || instance.Status == StatusFailed)
+								instance.notifyMu.Unlock()
+
+								if needsRetry {
+									// Retry with a fresh notification
+									m.reportProgress(instance)
+								}
+							}()
+						}
+					} else {
+						log.WithFields(log.Fields{
+							"job_id":   jobID,
+							"job_type": jobType,
+							"status":   string(status),
+							"error":    err.Error(),
+						}).Warn("failed to notify Panel of job status")
+					}
+				}
+			}(instance.Job.GetID(), instance.Job.GetType(), instance.Status,
+				instance.Status == StatusCompleted || instance.Status == StatusFailed)
 		}
 	}
 
