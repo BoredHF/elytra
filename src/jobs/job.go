@@ -2,8 +2,12 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
+
+	"github.com/apex/log"
 
 	"github.com/pyrohost/elytra/src/remote"
 	"github.com/pyrohost/elytra/src/server"
@@ -59,6 +63,17 @@ type WebSocketJob interface {
 	GetWebSocketEventData() map[string]interface{}
 }
 
+// AsyncJob is an optional interface for jobs that should run asynchronously.
+// Jobs implementing this interface will have their Execute method run in a
+// separate goroutine, freeing up the worker immediately to process other jobs.
+// This is ideal for long-running operations like downloads that shouldn't block
+// the worker pool.
+type AsyncJob interface {
+	// IsAsync returns true if the job should be executed asynchronously.
+	// This allows jobs to conditionally run async based on their configuration.
+	IsAsync() bool
+}
+
 // Manager handles job execution and lifecycle
 type Manager struct {
 	jobs          map[string]*Instance
@@ -71,14 +86,18 @@ type Manager struct {
 
 // Instance wraps a Job implementation with execution metadata
 type Instance struct {
-	Job       Job         `json:"job"`
-	Status    Status      `json:"status"`
-	Progress  int         `json:"progress"`
-	Message   string      `json:"message"`
-	Error     string      `json:"error"`
-	Result    interface{} `json:"result"`
-	CreatedAt time.Time   `json:"created_at"`
-	UpdatedAt time.Time   `json:"updated_at"`
+	Job             Job         `json:"job"`
+	Status          Status      `json:"status"`
+	Progress        int         `json:"progress"`
+	Message         string      `json:"message"`
+	Error           string      `json:"error"`
+	Result          interface{} `json:"result"`
+	CreatedAt       time.Time   `json:"created_at"`
+	UpdatedAt       time.Time   `json:"updated_at"`
+	lastPanelNotify time.Time   // Track last Panel notification for rate limiting
+	lastStatus      Status      // Track last status to detect status changes
+	notifyMu        sync.Mutex  // Mutex to prevent race conditions in rate limiting
+	finalNotifySent bool        // Track if final status (completed/failed) was successfully sent to Panel
 }
 
 // NewManager creates a new job manager
@@ -222,6 +241,19 @@ func (r *progressReporter) ReportStatus(status Status, message string) {
 
 // executeJob runs a single job instance
 func (m *Manager) executeJob(instance *Instance) {
+	// Check if this job should run asynchronously
+	if asyncJob, ok := instance.Job.(AsyncJob); ok && asyncJob.IsAsync() {
+		// Run the job in a separate goroutine to free up the worker immediately
+		go m.runJobExecution(instance)
+		return
+	}
+
+	// Run synchronously for non-async jobs
+	m.runJobExecution(instance)
+}
+
+// runJobExecution performs the actual job execution logic
+func (m *Manager) runJobExecution(instance *Instance) {
 	defer func() {
 		if r := recover(); r != nil {
 			instance.Status = StatusFailed
@@ -267,47 +299,151 @@ func (m *Manager) executeJob(instance *Instance) {
 	}
 }
 
-// reportProgress automatically sends ALL status updates to the Panel and WebSocket clients
+// panelNotifyMinInterval is the minimum time between Panel notifications for progress updates
+const panelNotifyMinInterval = 2 * time.Second
+
+// reportProgress automatically sends status updates to the Panel and WebSocket clients
+// Panel notifications are rate-limited to avoid overwhelming the Panel with progress updates
 func (m *Manager) reportProgress(instance *Instance) {
-	// Send Panel notification
+	// Send Panel notification (with rate limiting for progress updates)
 	if m.client != nil {
-		// Prepare status notification with all current information
-		notification := map[string]interface{}{
-			"status":        string(instance.Status),
-			"progress":      instance.Progress,
-			"message":       instance.Message,
-			"job_type":      instance.Job.GetType(),
-			"error_message": instance.Error,
-			"updated_at":    instance.UpdatedAt.Unix(),
+		// Use mutex to prevent race conditions when multiple goroutines report progress
+		instance.notifyMu.Lock()
+
+		// Determine if we should send a Panel notification
+		// Always send on status changes (pending->running, running->completed/failed)
+		// Rate limit progress updates during "running" status
+		// For final status (completed/failed), always retry if not successfully sent
+		statusChanged := instance.Status != instance.lastStatus
+		isFinalStatus := instance.Status == StatusCompleted || instance.Status == StatusFailed
+		timeSinceLastNotify := time.Since(instance.lastPanelNotify)
+		shouldNotifyPanel := statusChanged ||
+			isFinalStatus ||
+			timeSinceLastNotify >= panelNotifyMinInterval
+
+		// For final status, always notify if it hasn't been successfully sent yet
+		// This ensures users who navigate away can still see the final status
+		if isFinalStatus && !instance.finalNotifySent {
+			shouldNotifyPanel = true
 		}
 
-		// Set successful field based on current status
-		if instance.Status == StatusCompleted {
-			notification["successful"] = true
-			if instance.Result != nil {
-				if resultMap, ok := instance.Result.(map[string]interface{}); ok {
-					for key, value := range resultMap {
-						notification[key] = value
-					}
+		if shouldNotifyPanel {
+			// Update tracking fields
+			instance.lastPanelNotify = time.Now()
+			if statusChanged {
+				instance.lastStatus = instance.Status
+				// Reset final notify flag when status changes to a final state
+				if isFinalStatus {
+					instance.finalNotifySent = false
 				}
 			}
-		} else if instance.Status == StatusFailed {
-			notification["successful"] = false
-		} else {
-			// For pending/running statuses, indicate not yet complete
-			notification["successful"] = false
 		}
 
-		// Send status notification to Panel asynchronously for ALL status changes
-		go func() {
-			if err := m.client.ReportJobCompletion(context.Background(), instance.Job.GetID(), notification); err != nil {
-				// Log error but don't fail the job
-				fmt.Printf("Failed to notify Panel of job status: %v\n", err)
+		instance.notifyMu.Unlock()
+
+		if shouldNotifyPanel {
+			// Prepare status notification with all current information
+			notification := map[string]interface{}{
+				"status":        string(instance.Status),
+				"progress":      instance.Progress,
+				"message":       instance.Message,
+				"job_type":      instance.Job.GetType(),
+				"error_message": instance.Error,
+				"updated_at":    instance.UpdatedAt.Unix(),
 			}
-		}()
+
+			// Set successful field based on current status
+			if instance.Status == StatusCompleted {
+				notification["successful"] = true
+				if instance.Result != nil {
+					if resultMap, ok := instance.Result.(map[string]interface{}); ok {
+						for key, value := range resultMap {
+							notification[key] = value
+						}
+					}
+				}
+			} else if instance.Status == StatusFailed {
+				notification["successful"] = false
+			} else {
+				// For pending/running statuses, indicate not yet complete
+				notification["successful"] = false
+			}
+
+			// Send status notification to Panel asynchronously
+			// Use a context with timeout to prevent notifications from hanging indefinitely
+			go func(jobID, jobType string, status Status, isFinalStatus bool) {
+				// For final status updates (completed/failed), use a longer timeout to ensure
+				// they eventually get through even if the Panel is slow. This is critical for
+				// users who navigate away and come back - they need to see the final status.
+				timeout := 10 * time.Second
+				if isFinalStatus {
+					timeout = 20 * time.Second // Longer timeout for final status to ensure delivery
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				defer cancel()
+
+				err := m.client.ReportJobCompletion(ctx, jobID, notification)
+
+				// Update tracking for final status notifications
+				if isFinalStatus {
+					instance.notifyMu.Lock()
+					if err == nil {
+						instance.finalNotifySent = true
+					}
+					instance.notifyMu.Unlock()
+				}
+
+				if err != nil {
+					// Log error with context but don't fail the job
+					// Suppress context timeout/cancel errors to reduce log spam when Panel is slow
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+						// For final status, log at info level since it's important
+						// For progress updates, use debug level to avoid spam
+						logger := log.WithFields(log.Fields{
+							"job_id":   jobID,
+							"job_type": jobType,
+							"status":   string(status),
+						})
+						if isFinalStatus {
+							logger.Info("Panel notification timed out (Panel may be slow)")
+						} else {
+							logger.Debug("Panel notification timed out (Panel may be slow)")
+						}
+
+						// For final status that timed out, schedule a retry after a delay
+						// This ensures users who navigate away can still see the final status
+						if isFinalStatus {
+							go func() {
+								// Retry after a short delay to give Panel time to recover
+								time.Sleep(5 * time.Second)
+								// Re-check if notification was sent (another goroutine might have succeeded)
+								instance.notifyMu.Lock()
+								needsRetry := !instance.finalNotifySent &&
+									(instance.Status == StatusCompleted || instance.Status == StatusFailed)
+								instance.notifyMu.Unlock()
+
+								if needsRetry {
+									// Retry with a fresh notification
+									m.reportProgress(instance)
+								}
+							}()
+						}
+					} else {
+						log.WithFields(log.Fields{
+							"job_id":   jobID,
+							"job_type": jobType,
+							"status":   string(status),
+							"error":    err.Error(),
+						}).Warn("failed to notify Panel of job status")
+					}
+				}
+			}(instance.Job.GetID(), instance.Job.GetType(), instance.Status,
+				instance.Status == StatusCompleted || instance.Status == StatusFailed)
+		}
 	}
 
-	// Send WebSocket event for real-time updates
+	// Send WebSocket event for real-time updates (no rate limiting - WebSocket is lightweight)
 	m.publishWebSocketEvent(instance)
 }
 
@@ -351,13 +487,9 @@ func (m *Manager) publishWebSocketEvent(instance *Instance) {
 		eventData["error"] = instance.Error
 	}
 
-	// Include result data if completed
-	if instance.Status == StatusCompleted && instance.Result != nil {
-		if resultMap, ok := instance.Result.(map[string]interface{}); ok {
-			for key, value := range resultMap {
-				eventData[key] = value
-			}
-		}
+	// Include result data if completed or failed - wrap in "result" key as frontend expects
+	if (instance.Status == StatusCompleted || instance.Status == StatusFailed) && instance.Result != nil {
+		eventData["result"] = instance.Result
 	}
 
 	// Get the event type from the job (allows job-specific event types)
